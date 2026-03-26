@@ -1,0 +1,2 @@
+"""ResumeCopyApp package."""
+
