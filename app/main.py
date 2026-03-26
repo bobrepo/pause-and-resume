@@ -2,12 +2,12 @@ import sys
 
 from PyQt5.QtWidgets import QApplication
 
-from app.ui.main_window import MainWindow
+from app.ui.main_window import WizardWindow
 
 
 def main() -> int:
     app = QApplication(sys.argv)
-    win = MainWindow()
+    win = WizardWindow()
     win.show()
     return app.exec_()
 

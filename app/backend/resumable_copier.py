@@ -25,6 +25,8 @@ class ResumableCopier(QObject):
     speedChanged = pyqtSignal(float)  # MB/s
     statusChanged = pyqtSignal(str)
     errorOccurred = pyqtSignal(str)
+    copyCompleted = pyqtSignal(str, str)  # final_path, partial_path
+    deviceDisconnected = pyqtSignal(str, str)  # message, partial_path
 
     def __init__(
         self,
@@ -45,7 +47,8 @@ class ResumableCopier(QObject):
         self.pause_requested = False
 
         self.source_path: Optional[str] = None
-        self.dest_path: Optional[str] = None
+        self.dest_path: Optional[str] = None  # partial/working file
+        self.final_dest_path: Optional[str] = None
         self.meta_path: Optional[str] = None
 
         self.source_size: int = 0
@@ -94,9 +97,9 @@ class ResumableCopier(QObject):
         # This keeps resume robust after interruptions (USB disconnect/reconnect).
         if not self.source_path or not self.dest_path:
             return
-        self.start_or_resume(self.source_path, self.dest_path)
+        self.start_or_resume(self.source_path, self.dest_path, self.final_dest_path or self.dest_path)
 
-    def start_or_resume(self, source_path: str, destination_path: str) -> None:
+    def start_or_resume(self, source_path: str, partial_destination_path: str, final_destination_path: str) -> None:
         self._set_status("Starting")
         self.timer.stop()
         self.pause_requested = False
@@ -105,7 +108,8 @@ class ResumableCopier(QObject):
         try:
             # Normalize paths for robust resume across different drive-letter casing etc.
             self.source_path = os.path.abspath(str(Path(source_path)))
-            self.dest_path = os.path.abspath(str(Path(destination_path)))
+            self.dest_path = os.path.abspath(str(Path(partial_destination_path)))
+            self.final_dest_path = os.path.abspath(str(Path(final_destination_path)))
             source_path_norm = os.path.normcase(self.source_path)
             dest_path_norm = os.path.normcase(self.dest_path)
             self.meta_path = self.dest_path + ".resume.json"
@@ -282,10 +286,21 @@ class ResumableCopier(QObject):
         if to_copy <= 0:
             return
 
-        self.src_fp.seek(offset)
-        data = read_exact(self.src_fp, to_copy)
-        if len(data) != to_copy:
-            raise IOError(f"Unexpected EOF while reading chunk {chunk_idx}")
+        try:
+            self.src_fp.seek(offset)
+            data = read_exact(self.src_fp, to_copy)
+            if len(data) != to_copy:
+                raise IOError(f"Unexpected EOF while reading chunk {chunk_idx}")
+        except OSError as e:
+            if _looks_like_device_disconnect(e):
+                self.timer.stop()
+                self._set_status("Disconnected")
+                self.deviceDisconnected.emit(
+                    "USB/peripheral device disconnected. Your partial file is saved and you can resume from where it left off.",
+                    self.dest_path or "",
+                )
+                raise
+            raise
 
         self.dest_fp.seek(offset)
         written = self.dest_fp.write(data)
@@ -355,4 +370,35 @@ class ResumableCopier(QObject):
         self.speedChanged.emit(0.0)
         self._set_status("Complete")
         self._close_files()
+
+        partial_path = self.dest_path or ""
+        final_path = self.final_dest_path or partial_path
+
+        # Finalize "formatting correctly": rename partial to final atomically where possible.
+        try:
+            if partial_path and final_path and os.path.normcase(partial_path) != os.path.normcase(final_path):
+                os.replace(partial_path, final_path)
+        except Exception:
+            # If rename fails, keep partial; user can manually rename.
+            final_path = partial_path
+
+        # Metadata is no longer needed once complete.
+        try:
+            if self.meta_path and os.path.exists(self.meta_path):
+                os.remove(self.meta_path)
+        except Exception:
+            pass
+
+        self.copyCompleted.emit(final_path, partial_path)
+
+
+def _looks_like_device_disconnect(e: OSError) -> bool:
+    # Common Windows I/O codes when removable media disappears mid-read.
+    winerror = getattr(e, "winerror", None)
+    if winerror in (21, 1117, 1167, 31):  # ERROR_NOT_READY, ERROR_IO_DEVICE, ERROR_DEVICE_NOT_CONNECTED, ERROR_GEN_FAILURE
+        return True
+    msg = str(e).lower()
+    if "device" in msg and ("not ready" in msg or "i/o" in msg or "io" in msg or "disconnected" in msg):
+        return True
+    return False
 
